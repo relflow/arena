@@ -1,0 +1,41 @@
+__pycache__/
+*.py[oc]
+.venv/
+.cache/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.DS_Store
+/runs/
+/mlflow/
+*.ckpt
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite3
+*.db
+*.tar.gz
+*.tar.zst
+*.zip
+
+# Reports and migration provenance under results/ remain trackable.
+# Source archives and checkpoints remain local files cataloged by hash.
+
+# local secrets and environments
+.env
+*.env
+# experiment outputs
+mlruns/
+*.log
+*.npy
+text-store/
+derived/
+work/
+# editors and agents
+.idea/
+.vscode/
+.claude/
+*.swp
