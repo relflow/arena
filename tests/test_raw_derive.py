@@ -17,6 +17,7 @@ SCHEMA = {
     "orders": {"pkey": "order_id", "time_col": "placed", "fkeys": {"user_id": "users", "shop_id": "shops"}},
     "ratings": {"time_col": "rated", "fkeys": {"user_id": "users", "shop_id": "shops"}},
     "items": {"pkey": "item_id", "time_col": None, "fkeys": {"order_id": "orders"}},
+    "shipments": {"fkeys": {"order_id": "orders"}},
     "team_events": {"time_col": "happened", "fkeys": {"team_id": "teams"}},
 }
 
@@ -82,6 +83,13 @@ def database():
             "qty": rng.integers(1, 9, orders * 3),
         }
     )
+    frames["shipments"] = pa.table(
+        {
+            "order_id": np.arange(orders),
+            "carrier": rng.choice(["dhl", "ups", "post"], orders),
+            "weight": rng.gamma(2.0, 1.5, orders),
+        }
+    )
     frames["team_events"] = pa.table(
         {
             "team_id": np.repeat(np.arange(4), 5),
@@ -114,15 +122,20 @@ def test_relations_follow_the_foreign_key_graph(task):
         "ratings is absorbed as an aligned sibling, team events reach through the root's team"
     )
     orders = branches["orders"]
-    assert [lookup.table for lookup in orders.lookups] == ["shops", "ratings", "regions"], (
-        "the second hop reaches the vocabulary behind the shop"
+    assert [lookup.table for lookup in orders.lookups] == ["shops", "ratings", "shipments", "regions"], (
+        "the second hop reaches the vocabulary behind the shop; a one-row-per-order child folds into the row"
     )
+    shipments = orders.lookups[2]
+    assert shipments.key == ("order_id",) and shipments.via == ("order_id",) and shipments.time is None
+    assert [column.name for column in shipments.columns] == ["shipments_carrier", "shipments_weight"]
     shops, ratings = orders.lookups[0], orders.lookups[1]
     assert shops.key == ("shop_id",) and shops.reads == ("region_id",), "only the joined key is indexed"
     sources = raw.sources(task)
     assert sources["shops"]["indexes"] == [["shop_id"]] and "region_id" in sources["shops"]["columns"]
     assert ratings.time == "rated" and ratings.key == ("user_id", "shop_id") and ratings.via == ("user_id", "shop_id")
-    assert orders.child_key == "order_id" and [nested.table for nested in orders.nested] == ["items"]
+    assert orders.child_key == "order_id" and [nested.table for nested in orders.nested] == ["items"], (
+        "shipments never holds more than one row per order, so it is not a collection"
+    )
     assert orders.time == "placed" and orders.length == derive.BUDGETS["small"]["branch"] and orders.overflow == "tail"
     assert orders.nested[0].length == derive.BUDGETS["small"]["nested"]
     assert task.keys == (("__team_id", "team_id"),)
@@ -172,6 +185,7 @@ def test_rendered_query_returns_one_row_per_anchor_and_the_schema_loads(task, da
     assert result.num_rows == 50 and sorted(result["__row_position"].to_pylist()) == list(range(50))
     orders = result["orders"]
     assert pa.types.is_list(orders.type) and orders.type.value_type.get_field_index("items") >= 0
+    assert orders.type.value_type.get_field_index("shipments_carrier") >= 0
     assert max(pa.compute.list_value_length(orders).to_pylist()) <= task.branches[0].length
     meta = derive.Meta("toy", "churn", "binary_classification", "users", "user_id", "timestamp", "target")
     directory = derive.write(task, meta, tmp_path / "derived")

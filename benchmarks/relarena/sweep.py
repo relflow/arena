@@ -110,7 +110,13 @@ SPACES = {
 }
 # The untuned regime takes its tier's batch cap and the shared architecture defaults; a tier may
 # override the rest, within the coarse size tiers the harness allows.
-TIER_OVERRIDES = {"small": {"dropout": 0.3, "learning_rate": 2e-3, "weight_decay": 0.1, "ema_decay": 0.99}}
+# Trial-0 defaults per tier, the configurations the 2026-10-24 Modal campaign launched with; a loop
+# started elsewhere (lab, Colab) must begin from the same point so its conversions are comparable.
+TIER_OVERRIDES = {
+    "small": {"dropout": 0.3, "learning_rate": 2e-3, "weight_decay": 0.1, "ema_decay": 0.99},
+    "medium": {"d_model": 96, "n_heads": 4, "dropout": 0.2, "learning_rate": 4e-4},
+    "large": {"d_model": 128, "n_heads": 8, "dropout": 0.1, "learning_rate": 3e-4},
+}
 # Trials that share a configuration and differ only by seed are selected on their mean validation score.
 SEEDS = {"small": 3, "medium": 1, "large": 1}
 TIER_DEFAULTS = {

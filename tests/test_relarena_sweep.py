@@ -73,7 +73,7 @@ def test_plan_puts_the_default_first_and_samples_distinct_configs_reproducibly()
     assert first == second
     assert first["tier"] == "medium" and len(first["trials"]) == 13
     assert first["budget"] == {"passes": 8, "backstop_seconds": 4 * 3600.0}
-    assert first["trials"][0]["config"] == sweep.DEFAULT
+    assert first["trials"][0]["config"] == sweep.TIER_DEFAULTS["medium"], "trial 0 is the tier's launch default"
     configs = [json.dumps(t["config"], sort_keys=True) for t in first["trials"]]
     assert len(set(configs)) == len(configs)
     space = sweep.SPACES["medium"]

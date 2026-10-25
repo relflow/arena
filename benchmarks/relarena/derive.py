@@ -175,6 +175,16 @@ def fanout(con: duckdb.DuckDBPyConnection, table: Table, keys: tuple[str, ...]) 
     return float(value or 0)
 
 
+def peak(con: duckdb.DuckDBPyConnection, table: Table, keys: tuple[str, ...]) -> int:
+    """The most rows any key tuple has; one means the table is a one-to-one extension of its key."""
+    group = ", ".join(quote(key) for key in keys)
+    present = " AND ".join(f"{quote(key)} IS NOT NULL" for key in keys)
+    value = con.execute(
+        f"SELECT max(n) FROM (SELECT count(*) AS n FROM {table.source} WHERE {present} GROUP BY {group})"
+    ).fetchone()[0]
+    return int(value or 0)
+
+
 def alignment(
     con: duckdb.DuckDBPyConnection, sibling: Table, branch: Table, pairs: tuple[tuple[str, str], ...]
 ) -> tuple[float, float]:
@@ -251,12 +261,22 @@ def budget(mean_len: float | None) -> int:
     return 16 if length < 40 else 32 if length < 160 else 64 if length < 700 else 96
 
 
-def same_time(con: duckdb.DuckDBPyConnection, table: Table, column: str, row_time: str, dimension: Table) -> bool:
-    """Whether a dimension's timestamp repeats the row's own time column on the joined rows."""
+def same_time(
+    con: duckdb.DuckDBPyConnection,
+    table: Table,
+    column: str,
+    row_time: str,
+    dimension: Table,
+    on: str | None = None,
+) -> bool:
+    """Whether a dimension's timestamp repeats the row's own time column on the joined rows.
+
+    The join reaches the dimension's primary key unless ``on`` names another of its columns.
+    """
     rate = con.execute(
         f"SELECT avg(CASE WHEN r.{quote(row_time)} = d.{quote(dimension.time)} THEN 1 ELSE 0 END) "
         f"FROM (SELECT {quote(column)}, {quote(row_time)} FROM {table.source} USING SAMPLE {SAMPLE} ROWS) r "
-        f"JOIN {dimension.source} d ON r.{quote(column)} = d.{quote(dimension.pkey)} "
+        f"JOIN {dimension.source} d ON r.{quote(column)} = d.{quote(on or dimension.pkey)} "
         f"WHERE r.{quote(row_time)} IS NOT NULL AND d.{quote(dimension.time)} IS NOT NULL"
     ).fetchone()[0]
     return (rate or 0) >= 0.99
@@ -496,11 +516,13 @@ def nested_for(
     entity: str,
     absorbed: set[str],
     budgets: Mapping[str, int],
-    nested_text: bool = False,
-) -> tuple[str | None, tuple[Branch, ...]]:
+) -> tuple[str | None, tuple[Branch, ...], tuple[tuple[Table, str], ...]]:
     """Children of the branch's rows or of one dimension it points at, keyed by the branch column that reaches them.
 
-    ``nested_text`` lets prose ride along at depth two, which the default rule leaves out.
+    Returns the key, the nested branches, and the children that never hold more than one row
+    per key as ``(table, column)`` pairs: those are one-to-one extensions of the branch row,
+    which the caller folds into its lookups under the field budget instead of nesting as
+    collections (rel-trial's ``designs`` and ``eligibilities`` are one row per study).
     """
     options: dict[str, list[tuple[Table, str]]] = {}
     link = own_columns(branch) <= LINK_COLUMNS
@@ -516,12 +538,17 @@ def nested_for(
                 for via, via_target in branch.fkeys.items():
                     if via_target == target:
                         options.setdefault(via, []).append((candidate, column))
-    best: tuple[str | None, list[Branch]] = (None, [])
+    best: tuple[str | None, list[Branch], list[tuple[Table, str]]] = (None, [], [])
     for child_key, candidates in options.items():
         branches: list[Branch] = []
+        folded: list[tuple[Table, str]] = []
         taken = Names()
         for candidate, column in candidates:
-            if fanout(con, candidate, (column,)) > NESTED_FANOUT:
+            rows_per_key = fanout(con, candidate, (column,))
+            if rows_per_key > NESTED_FANOUT:
+                continue
+            if rows_per_key <= 1 and peak(con, candidate, (column,)) <= 1:
+                folded.append((candidate, column))
                 continue
             names = Names()
             columns = typed(
@@ -530,7 +557,7 @@ def nested_for(
                 dataset,
                 names,
                 exclude={column, *((candidate.time,) if candidate.time else ())},
-                text=nested_text,
+                text=False,
             )
             hop1, _ = lookups_for(
                 con,
@@ -540,7 +567,7 @@ def nested_for(
                 names,
                 exclude={column},
                 hops=1,
-                text=nested_text,
+                text=False,
                 row_time=candidate.time,
             )
             columns, lookups = trim(columns, [hop1], budgets["fields"])
@@ -561,9 +588,9 @@ def nested_for(
                     intraday=intraday(candidate),
                 )
             )
-        if len(branches) > len(best[1]):
-            best = (child_key, branches)
-    return best[0], tuple(best[1])
+        if len(branches) + len(folded) > len(best[1]) + len(best[2]):
+            best = (child_key, branches, folded)
+    return best[0], tuple(best[1]), tuple(best[2])
 
 
 def derive(
@@ -572,12 +599,11 @@ def derive(
     meta: Meta,
     *,
     nested: bool = True,
-    nested_text: bool = False,
 ) -> Task:
     """Build the raw-structure task for one entity table from measured tables.
 
-    ``nested=False`` stops at depth one; ``nested_text`` admits prose below it. Both are
-    ablation switches for comparing derived structures, not harness options.
+    ``nested=False`` stops at depth one: an ablation switch for comparing derived
+    structures, not a harness option. Prose is admitted at depth one only.
     """
     entity = tables[meta.entity_table]
     if entity.pkey is None:
@@ -637,21 +663,31 @@ def derive(
                 )
             )
             absorbed.add(sibling.name)
-        columns, lookups = trim(columns, [hop1, siblings, hop2], budgets["fields"])
-        child_key, children = (
-            nested_for(
-                con,
-                table,
-                tables,
-                meta.dataset,
-                entity=entity.name,
-                absorbed=absorbed,
-                budgets=budgets,
-                nested_text=nested_text,
-            )
+        child_key, children, extensions = (
+            nested_for(con, table, tables, meta.dataset, entity=entity.name, absorbed=absorbed, budgets=budgets)
             if nested
-            else (None, ())
+            else (None, (), ())
         )
+        folded: list[Lookup] = []
+        for extension, column_of in extensions:
+            alias = aliases.take(extension.name)
+            skip = {column_of}
+            if extension.time and (
+                not table.time or same_time(con, table, child_key, table.time, extension, on=column_of)
+            ):
+                skip.add(extension.time)
+            folded.append(
+                Lookup(
+                    alias,
+                    extension.name,
+                    f"{{t}}.{quote(column_of)} = {{row}}.{quote(child_key)}",
+                    typed(extension, tables, meta.dataset, names, prefix=alias + "_", exclude=skip),
+                    time=extension.time,
+                    key=(column_of,),
+                    via=(child_key,),
+                )
+            )
+        columns, lookups = trim(columns, [hop1, siblings, folded, hop2], budgets["fields"])
         multiple = sum(1 for t, _ in candidates if t is table) > 1
         branches.append(
             Branch(
@@ -805,7 +841,6 @@ def derive_relbench(
     *,
     threads: int = 8,
     nested: bool = True,
-    nested_text: bool = False,
 ) -> pathlib.Path:
     """Derive one RelBench task from the cache as the harness would present it, writing its bundle under ``output``."""
     dataset, task = name.split("/")
@@ -814,7 +849,7 @@ def derive_relbench(
     con = duckdb.connect()
     con.execute(f"SET threads TO {threads}")
     tables = profile(con, relbench_sources(cache, dataset, schema, cutoff), schema)
-    directory = write(derive(con, tables, meta, nested=nested, nested_text=nested_text), meta, output)
+    directory = write(derive(con, tables, meta, nested=nested), meta, output)
     record = {
         "dataset": dataset,
         "task": task,
@@ -836,7 +871,6 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=pathlib.Path, required=True, help="Root receiving <dataset>/<task>/")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--no-nested", action="store_true", help="ablation: stop at depth one")
-    parser.add_argument("--nested-text", action="store_true", help="ablation: admit prose fields below depth one")
     args = parser.parse_args(argv)
     directory = derive_relbench(
         args.cache,
@@ -844,7 +878,6 @@ def main(argv=None) -> int:
         args.output,
         threads=args.threads,
         nested=not args.no_nested,
-        nested_text=args.nested_text,
     )
     print(json.dumps({"task": args.relbench, "bundle": str(directory)}))
     return 0
