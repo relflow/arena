@@ -671,7 +671,7 @@ def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict
             "--weight-decay",
             str(config["weight_decay"]),
             "--seed",
-            str(args.seed),
+            str(best.get("seed", args.seed)),
             "--accelerator",
             "gpu",
             "--precision",

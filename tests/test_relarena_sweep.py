@@ -481,7 +481,14 @@ def test_refit_of_one_trial_lands_on_that_trial(tmp_path, monkeypatch):
             "stages": {"supervised": {"steps": 40, "equivalent_full_epochs": 1.0, "seconds": 6.0}},
         }
     )
-    trial = {"index": 3, "config": sweep.DEFAULT, "status": "done", "result": str(result), "summary": summary}
+    trial = {
+        "index": 3,
+        "config": sweep.DEFAULT,
+        "seed": 2,
+        "status": "done",
+        "result": str(result),
+        "summary": summary,
+    }
     state = {"version": 1, "name": "unit", "task": "rel-f1/driver-position", "tier": "small", "seed": 0, "plan_sha256": "x", "trials": [trial]}  # fmt: skip
 
     def fake_run(argv, cwd, env, stdout, stderr):
@@ -495,6 +502,9 @@ def test_refit_of_one_trial_lands_on_that_trial(tmp_path, monkeypatch):
     record = sweep.refit(args, state, directory, trial=trial)
 
     assert record["status"] == "done" and record["test"] == {"mae": 0.7}
+    assert record["attempts"][0]["command"][record["attempts"][0]["command"].index("--seed") + 1] == "2", (
+        "a seed's refit keeps its seed"
+    )
     assert trial["refit"] is record and "refit" not in state
     assert (directory / "trial-003/refit/bundle/model.yaml").exists()
     assert "0.70000" in sweep.leaderboard(state), "the leaderboard shows how the trial converted"
