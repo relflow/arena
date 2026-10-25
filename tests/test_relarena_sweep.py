@@ -246,7 +246,7 @@ def test_run_records_results_resumes_and_honours_stop(tmp_path, monkeypatch):
 
 
 def test_run_rejects_state_from_another_plan(tmp_path):
-    data = sweep.plan("rel-f1/driver-position", 7453, 1, seed=1)
+    data = sweep.plan("rel-f1/driver-position", 7453, 1, seed=1, seeds=1)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(data))
     (tmp_path / "sweep").mkdir()
@@ -339,7 +339,7 @@ def test_report_rebuilds_summaries_from_result_files(tmp_path):
 
     rebuilt = json.loads((directory / "state.json").read_text())["trials"][0]["summary"]
     assert rebuilt["score"] == 0.5 and rebuilt["steps"] == 10
-    assert "| 1 | 0 | 0.50000 |" in board and (directory / "README.md").read_text() == board
+    assert "| 1 | 0 | 0 | 0.50000 |" in board and (directory / "README.md").read_text() == board
 
 
 def test_command_takes_the_plan_budget_unless_overridden(tmp_path):
@@ -578,7 +578,7 @@ def test_queue_runs_tasks_smallest_first_and_skips_finished_ones(tmp_path, monke
     assert sweep.queue(args) == 0
     assert order == ["rel-f1/driver-position", "rel-avito/user-visits"]
     plan_data = json.loads((runs / "raw-sweep-rel-f1-driver-position/plan.json").read_text())
-    assert plan_data["task"] == "rel-f1/driver-position" and len(plan_data["trials"]) == 4
+    assert plan_data["task"] == "rel-f1/driver-position" and len(plan_data["trials"]) == 4 * sweep.SEEDS["small"]
     assert (runs / "raw-sweep-rel-avito-user-visits/DONE").exists()
     (runs / "STOP").write_text("")
     order.clear()
@@ -695,7 +695,7 @@ def test_failure_names_the_child_error_or_its_exit():
 
 
 def test_run_relaunches_an_out_of_memory_trial_at_half_the_batch_size(tmp_path, monkeypatch):
-    data = sweep.plan("rel-f1/driver-position", 7453, 1, seed=1)
+    data = sweep.plan("rel-f1/driver-position", 7453, 1, seed=1, seeds=1)
     data["trials"] = data["trials"][:1]
     data["trials"][0]["config"]["batch_size"] = 64
     plan_path = tmp_path / "plan.json"
@@ -813,7 +813,7 @@ def test_run_does_not_relaunch_other_failures_or_below_the_batch_floor(tmp_path,
 
 def test_run_trains_a_derived_structure_built_once_per_sweep(tmp_path, monkeypatch):
     monkeypatch.setattr(sweep, "structure", REAL_STRUCTURE)
-    data = sweep.plan("rel-f1/driver-position", 7453, 1, seed=1)
+    data = sweep.plan("rel-f1/driver-position", 7453, 1, seed=1, seeds=1)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(data))
     derivations, trials = [], []
@@ -902,7 +902,7 @@ def test_smoothed_objective_averages_the_best_validations():
 
 
 def test_optimize_proposes_trials_from_a_warm_started_study(tmp_path, monkeypatch, synthetic_structure):
-    plan_data = sweep.plan("rel-f1/driver-position", 7453, 0, 0)
+    plan_data = sweep.plan("rel-f1/driver-position", 7453, 0, 0, seeds=1)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan_data))
     earlier = tmp_path / "earlier-state.json"
@@ -928,7 +928,7 @@ def test_optimize_proposes_trials_from_a_warm_started_study(tmp_path, monkeypatc
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(sweep.subprocess, "run", fake_run)
-    args = options(plan=str(plan_path), output=str(tmp_path / "sweep"), trials=2, startup=1, warm_start=[str(earlier)], direction="minimize", source=str(tmp_path), environment={}, gpu_lock=None, no_refit=True, refit_every_trial=False, max_hours=0)  # fmt: skip
+    args = options(plan=str(plan_path), output=str(tmp_path / "sweep"), trials=2, startup=1, seeds=1, warm_start=[str(earlier)], direction="minimize", source=str(tmp_path), environment={}, gpu_lock=None, no_refit=True, refit_every_trial=False, max_hours=0)  # fmt: skip
     assert sweep.optimize(args) == 0
 
     state = json.loads((tmp_path / "sweep/state.json").read_text())
@@ -953,7 +953,14 @@ def test_small_plans_repeat_each_configuration_over_seeds_and_select_on_the_mean
     assert "mask" in sweep.SPACES["small"] and "jitter" in sweep.SPACES["small"]
 
     def done(index, config_id, seed, score, step):
-        return {"index": index, "config": sweep.TIER_DEFAULTS["small"], "config_id": config_id, "seed": seed, "status": "done", "summary": {"metric": "mae", "score": score, "selected_step": step}}  # fmt: skip
+        summary = sweep.summarize(
+            {
+                "status": "passed",
+                "selection": {"metric": "mae", "score": score, "step": step},
+                "stages": {"supervised": {"steps": step * 2, "equivalent_full_epochs": 2.0, "seconds": 30.0}},
+            }
+        )
+        return {"index": index, "config": sweep.TIER_DEFAULTS["small"], "config_id": config_id, "seed": seed, "status": "done", "summary": summary}  # fmt: skip
 
     lucky = {**sweep.TIER_DEFAULTS["small"], "dropout": 0.4}
     state = {"name": "unit", "task": "rel-f1/driver-position", "tier": "small", "seed": 0, "plan_sha256": "x",

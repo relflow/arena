@@ -400,7 +400,7 @@ def leaderboard(state: dict) -> str:
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---:|",
     ]
     ranked = groups(state)
-    if any(len(g["members"]) > 1 for g in ranked):
+    if any(len(g["members"]) > 1 for g in ranked) and all("d_model" in g["config"] for g in ranked):
         lines = (
             lines[:4]
             + [
@@ -569,7 +569,10 @@ def groups(state: dict) -> list[dict]:
     maximize = done[0]["summary"]["metric"] == "roc_auc"
     by: dict[str, list[dict]] = {}
     for trial in done:
-        by.setdefault(trial.get("config_id") or identity(trial["config"]), []).append(trial)
+        key = trial.get("config_id") or (
+            identity(trial["config"]) if trial.get("config") else f"trial-{trial['index']}"
+        )
+        by.setdefault(key, []).append(trial)
     out = []
     for key, members in by.items():
         members.sort(key=lambda t: t.get("seed", 0))
@@ -579,11 +582,11 @@ def groups(state: dict) -> list[dict]:
         out.append(
             {
                 "config_id": key,
-                "config": members[0]["config"],
+                "config": members[0].get("config", {}),
                 "members": members,
                 "score": sum(scores) / len(scores),
                 "spread": max(scores) - min(scores),
-                "selected_step": round(sum(t["summary"]["selected_step"] or 0 for t in members) / len(members)),
+                "selected_step": round(sum(t["summary"].get("selected_step") or 0 for t in members) / len(members)),
                 "test": sum(tests) / len(tests) if tests else None,
             }
         )
@@ -986,7 +989,7 @@ def optimize(args) -> int:
         config["batch_size"] = space["batch_size"][0]
         if config["d_model"] % config["n_heads"]:
             config["n_heads"] = max(head for head in space["n_heads"] if config["d_model"] % head == 0)
-        seeds = args.seeds or plan_data.get("seeds") or SEEDS[level]
+        seeds = getattr(args, "seeds", None) or plan_data.get("seeds") or SEEDS[level]
         members = [
             {"index": len(state["trials"]) + repeat, "config": config, "config_id": identity(config), "seed": plan_data["seed"] + repeat, "status": "pending", "optuna": asked.number}
             for repeat in range(seeds)
