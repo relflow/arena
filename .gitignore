@@ -39,3 +39,6 @@ work/
 .vscode/
 .claude/
 *.swp
+
+# local-only record of every run (state, reports, probes); refreshed by results/derived-campaign-20261024/collect.py
+results/derived-campaign-20261024/data/
