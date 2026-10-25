@@ -75,7 +75,7 @@ SPACES = {
         "n_heads": (4,),
         "ffnx": (4, 8),
         "dropout": (0.3, 0.4),
-        "batch_size": (256,),
+        "batch_size": (64,),
         "learning_rate": (1e-3, 3e-3),
         "weight_decay": (0.1, 0.3),
         "ema_decay": (0.99, 0.995),
@@ -175,8 +175,13 @@ def plan(
     default: dict | None = None,
     seeds: int | None = None,
     metric: str | None = None,
+    grid: list[dict] | None = None,
 ) -> dict:
     """The default configuration first, then ``trials`` distinct samples from the task's tier.
+
+    ``grid`` replaces sampling: the plan is exactly the default with each override applied, in
+    order, so a frozen comparison (two configurations by three stopping rules, say) is explicit.
+    Overrides may set the early-stopping knobs ``patience`` and ``plateau_patience``.
 
     Each configuration becomes ``seeds`` trials (the tier's count by default) that differ only
     by seed; selection averages them.
@@ -196,14 +201,25 @@ def plan(
     if metric == "roc_auc" and "objective" not in (space or {}):
         chosen["objective"] = (DEFAULT["objective"],)
     first = {**TIER_DEFAULTS[level], **(default or {})}
-    if unknown := sorted(set(first) - set(DEFAULT)):
-        raise KeyError(f"unknown default parameter(s) {unknown}; expected one of {sorted(DEFAULT)}")
-    if first["d_model"] % first["n_heads"]:
-        raise ValueError(f"default d_model {first['d_model']} must be divisible by n_heads {first['n_heads']}")
-    rng = random.Random(seed)
+    allowed = set(DEFAULT) | set(SCHEDULE_KNOBS)
+    for candidate in (first, *(grid or ())):
+        if unknown := sorted(set(candidate) - allowed):
+            raise KeyError(f"unknown configuration parameter(s) {unknown}; expected one of {sorted(allowed)}")
     configs, seen = [first], {json.dumps(first, sort_keys=True)}
+    if grid:
+        configs, seen = [], set()
+        for override in grid:
+            candidate = {**first, **override}
+            key = json.dumps(candidate, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                configs.append(candidate)
+    for candidate in configs:
+        if candidate["d_model"] % candidate["n_heads"]:
+            raise ValueError(f"d_model {candidate['d_model']} must be divisible by n_heads {candidate['n_heads']}")
+    rng = random.Random(seed)
     attempts = 0
-    while len(configs) < trials + 1 and attempts < 100 * (trials + 1):
+    while not grid and len(configs) < trials + 1 and attempts < 100 * (trials + 1):
         candidate = sample(chosen, rng)
         attempts += 1
         key = json.dumps(candidate, sort_keys=True)
@@ -225,6 +241,10 @@ def plan(
             for index, (config, repeat) in enumerate((c, r) for c in configs for r in range(seeds or SEEDS[level]))
         ],
     }
+
+
+# Early-stopping knobs a plan may vary per configuration; absent, the sweep's command-line values apply.
+SCHEDULE_KNOBS = ("patience", "plateau_patience")
 
 
 def identity(config: dict) -> str:
@@ -337,11 +357,11 @@ def command(
         "--val-every",
         str(max(1, min(args.val_every, math.ceil(args.training_rows / config["batch_size"])))),
         "--patience",
-        str(args.patience),
+        str(config.get("patience", args.patience)),
         "--plateau-factor",
         str(args.plateau_factor),
         "--plateau-patience",
-        str(args.plateau_patience),
+        str(config.get("plateau_patience", args.plateau_patience)),
         "--max-lr-drops",
         str(args.max_lr_drops),
         "--min-improvement",
@@ -623,12 +643,41 @@ def winner(state: dict) -> dict | None:
     }
 
 
-def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict | None:
+def windowed(history: list[dict], metric: str, window: int) -> int:
+    """The step at the centre of the best ``window`` consecutive validations, by their mean score.
+
+    A window of one is the single best validation. Wider windows ignore a lucky spike and carry
+    the step where the curve, not one evaluation, peaked into the refit.
+    """
+    if window < 1 or window % 2 == 0:
+        raise ValueError(f"selection window must be a positive odd integer, got {window}")
+    points = sorted({int(h["step"]): float(h[metric]) for h in history if metric in h}.items())
+    if not points:
+        raise ValueError("windowed selection needs a validation history carrying the metric")
+    lower = metric == "mae"
+    if len(points) <= window:
+        if window == 1:
+            return (min if lower else max)(points, key=lambda p: p[1])[0]
+        return points[len(points) // 2][0]
+    means = [sum(score for _, score in points[i : i + window]) / window for i in range(len(points) - window + 1)]
+    best = (min if lower else max)(range(len(means)), key=lambda i: means[i])
+    return points[best + window // 2][0]
+
+
+def windows(args) -> tuple[int, ...]:
+    """The selection windows every trial is refit with; the first is the sweep's canonical refit."""
+    text = str(getattr(args, "refit_windows", None) or "1")
+    return tuple(int(item) for item in text.split(",") if item.strip())
+
+
+def refit(args, state: dict, directory: Path, trial: dict | None = None, *, window: int = 1) -> dict | None:
     """Train a trial's configuration on the outer split for its tuned number of updates and score the test anchors.
 
     Without ``trial`` this refits the leaderboard winner into ``refit/`` and records it on the
     state; with one it refits that trial into its own directory and records it on the trial, so
-    a sweep can show how every configuration converts from validation to test.
+    a sweep can show how every configuration converts from validation to test. ``window`` picks
+    the carried step from a smoothed validation curve; the first window of a sweep is the
+    trial's canonical refit, the others land under ``refits``.
     """
     from benchmarks.relarena.refit import scaled
 
@@ -641,10 +690,23 @@ def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict
         return None
     report = json.loads(Path(best["result"]).read_text())
     validation_rows = int((report.get("data") or {}).get("validation_rows") or 0)
-    steps = scaled(int(best["summary"]["selected_step"]), int(args.training_rows), validation_rows)
+    selected = int(best["summary"]["selected_step"])
+    if window > 1:
+        result = report["result"] if isinstance(report.get("result"), dict) else report
+        selected = windowed(result.get("validation_history") or [], best["summary"]["metric"], window)
+    steps = scaled(selected, int(args.training_rows), validation_rows)
     config = best["config"]
-    refit_dir = directory / "refit" if trial is None else directory / f"trial-{best['index']:03d}" / "refit"
+    canonical = window == windows(args)[0]
+    leaf = "refit" if canonical else f"refit-w{window}"
+    refit_dir = directory / leaf if trial is None else directory / f"trial-{best['index']:03d}" / leaf
     holder = state if trial is None else best
+
+    def place(entry: dict) -> dict:
+        if canonical:
+            holder["refit"] = entry
+        holder.setdefault("refits", {})[str(window)] = entry
+        return entry
+
     if refit_dir.exists():
         shutil.rmtree(refit_dir)
     spec, manifest = structure(args, directory)
@@ -656,6 +718,8 @@ def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict
         "trial": best["index"],
         "config": config,
         "steps": steps,
+        "window": window,
+        "selected_step": selected,
         "regime": args.refit_regime,
         "started_at": time.time(),
         "attempts": [],
@@ -709,14 +773,14 @@ def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict
                     "--min-full-passes", str(args.min_full_passes), "--max-epochs", str(budget(args)["passes"]),
                     "--max-steps", str(args.max_steps),
                     "--val-every", str(max(1, min(args.val_every, math.ceil(args.training_rows / config["batch_size"])))),
-                    "--patience", str(args.patience), "--plateau-factor", str(args.plateau_factor),
-                    "--plateau-patience", str(args.plateau_patience), "--max-lr-drops", str(args.max_lr_drops),
+                    "--patience", str(config.get("patience", args.patience)), "--plateau-factor", str(args.plateau_factor),
+                    "--plateau-patience", str(config.get("plateau_patience", args.plateau_patience)), "--max-lr-drops", str(args.max_lr_drops),
                     "--min-improvement", str(args.min_improvement),
                     "--max-train-seconds", str(budget(args)["backstop_seconds"]),
                 ]
             )  # fmt: skip
         record["attempts"].append({"batch_size": batch, "command": argv})
-        holder["refit"] = {**record, "status": "running"}
+        place({**record, "status": "running"})
         save(directory, state)
         code = execute(args, argv, directory, refit_dir / "run.log")
         result_path = refit_dir / "result.json"
@@ -730,16 +794,18 @@ def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict
             result_path.unlink(missing_ok=True)
             continue
         break
-    holder["refit"] = {
-        **record,
-        "batch_size": batch,
-        "finished_at": time.time(),
-        "exit": code,
-        "result": str(result_path),
-        "status": "done" if code == 0 and outcome.get("status") == "passed" else "failed",
-        "test": outcome.get("test"),
-        "error": (outcome.get("error") or {}).get("message") if outcome.get("status") != "passed" else None,
-    }
+    placed = place(
+        {
+            **record,
+            "batch_size": batch,
+            "finished_at": time.time(),
+            "exit": code,
+            "result": str(result_path),
+            "status": "done" if code == 0 and outcome.get("status") == "passed" else "failed",
+            "test": outcome.get("test"),
+            "error": (outcome.get("error") or {}).get("message") if outcome.get("status") != "passed" else None,
+        }
+    )
     save(directory, state)
     print(
         json.dumps(
@@ -747,12 +813,12 @@ def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict
                 "sweep": args.name,
                 "event": "refit",
                 "trial": best["index"],
-                **{k: holder["refit"][k] for k in ("status", "test", "error")},
+                **{k: placed[k] for k in ("status", "test", "error")},
             }
         ),
         flush=True,
     )
-    return holder["refit"]
+    return placed
 
 
 def execute_trial(args, spec: BenchmarkSpec, manifest: Path, state: dict, directory: Path, trial: dict) -> None:
@@ -840,8 +906,9 @@ def execute_trial(args, spec: BenchmarkSpec, manifest: Path, state: dict, direct
         flush=True,
     )
     if trial["status"] == "done" and getattr(args, "refit_every_trial", False):
-        refit(args, state, directory, trial=trial)
-        save(directory, state)
+        for window in windows(args):
+            refit(args, state, directory, trial=trial, window=window)
+            save(directory, state)
 
 
 def run(args) -> int:
@@ -1128,6 +1195,11 @@ def arguments(argv=None):
         help="JSON object narrowing the tier's choices per parameter, such as '{\"ema_decay\": [null]}'",
     )
     planner.add_argument("--default", type=json.loads, help="JSON object overriding the first trial's configuration")
+    planner.add_argument(
+        "--grid",
+        type=json.loads,
+        help="JSON list of override objects; the plan is exactly these configurations times seeds, no sampling",
+    )
     planner.add_argument("--output", type=Path, required=True)
     reporter = commands.add_parser("report", help="Rebuild summaries and the leaderboard from finished trials")
     reporter.add_argument("--output", required=True, help="Sweep directory holding state.json and trial-NNN/")
@@ -1137,6 +1209,11 @@ def arguments(argv=None):
     execution.add_argument("--cache", type=Path, required=True)
     execution.add_argument("--seed", type=int, default=0)
     execution.add_argument("--passes", type=int, help="Full passes per trial; default is the plan's tier budget")
+    execution.add_argument(
+        "--refit-windows",
+        default="1",
+        help="Comma-separated odd selection windows each trial is refit with; the first is the canonical refit",
+    )
     execution.add_argument("--trial-seconds", type=float, help="Wall-clock backstop per trial; default is the tier's")
     execution.add_argument(
         "--max-hours", type=float, default=0, help="Stop admitting trials after this many hours; 0 runs the plan"
@@ -1230,6 +1307,7 @@ def main(argv=None) -> int:
             default=args.default,
             seeds=args.seeds,
             metric=metric_of(args.task),
+            grid=args.grid,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(data, indent=2) + "\n")

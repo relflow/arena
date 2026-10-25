@@ -57,3 +57,21 @@ def test_modal_commands_pass_the_narrowing_and_the_schedule_through():
         tracking=Path("/vol/mlflow"),
     )
     assert "--space" not in bare and "--default" not in bare
+    plan, run = modal_sweep.commands(
+        "rel-avito/ad-ctr",
+        output=Path("/vol/runs/x"),
+        cache=Path("/vol/cache/relbench"),
+        python="python",
+        source="/root",
+        trials=0,
+        seed=0,
+        trial_seconds=600,
+        max_hours=1.0,
+        tracking=Path("/vol/mlflow"),
+        refit_every_trial=True,
+        grid='[{}, {"learning_rate": 0.00076}]',
+        refit_windows="1,3,5",
+    )
+    assert plan[plan.index("--grid") + 1] == '[{}, {"learning_rate": 0.00076}]' and "--trials" in plan
+    assert run[run.index("--refit-windows") + 1] == "1,3,5" and "--refit-every-trial" in run
+    assert "--grid" not in bare and "--refit-windows" not in bare

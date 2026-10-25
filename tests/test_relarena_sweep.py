@@ -100,6 +100,44 @@ def test_classification_plans_pin_the_loss_objective_and_pinned_knobs_are_never_
     assert regression["space"]["objective"] == sweep.SPACES["small"]["objective"]
 
 
+def test_plan_grid_enumerates_exact_configurations_with_stopping_knobs():
+    grid = [
+        {"patience": 2, "plateau_patience": 1},
+        {"patience": 8, "plateau_patience": 4},
+        {"learning_rate": 7.6e-4, "weight_decay": 0.01, "patience": 2, "plateau_patience": 1},
+        {"learning_rate": 7.6e-4, "weight_decay": 0.01, "patience": 8, "plateau_patience": 4},
+    ]
+    data = sweep.plan("rel-avito/ad-ctr", 5_100, 12, seed=0, grid=grid, metric="mae")
+    assert len(data["trials"]) == 4 * sweep.SEEDS["small"], "no sampling: the grid times seeds"
+    first = data["trials"][0]["config"]
+    assert first == {**sweep.TIER_DEFAULTS["small"], "patience": 2, "plateau_patience": 1}
+    assert first["batch_size"] == 64, "the small tier trains at batch 64"
+    assert data["trials"][-1]["config"]["learning_rate"] == 7.6e-4 and data["trials"][-1]["config"]["patience"] == 8
+    args = options()
+    args.task, args.training_rows, args.patience, args.plateau_patience = "rel-avito/ad-ctr", 5_100, 12, 4
+    text = " ".join(sweep.command(args, first, Path("b.yaml"), Path("t"), None))
+    assert "--patience 2 " in text and "--plateau-patience 1 " in text, "the configuration's stopping knobs win"
+    text = " ".join(sweep.command(args, sweep.TIER_DEFAULTS["small"], Path("b.yaml"), Path("t"), None))
+    assert "--patience 12 " in text and "--plateau-patience 4 " in text, "without them the sweep's values apply"
+    with pytest.raises(KeyError):
+        sweep.plan("rel-avito/ad-ctr", 5_100, 0, seed=0, grid=[{"warmup": 3}])
+
+
+def test_windowed_selection_smooths_the_validation_curve():
+    history = [{"step": s, "mae": m} for s, m in ((100, 0.50), (200, 0.45), (300, 0.20), (400, 0.46), (500, 0.32), (600, 0.30), (700, 0.33))]  # fmt: skip
+    assert sweep.windowed(history, "mae", 1) == 300, "a window of one is the best single validation"
+    assert sweep.windowed(history, "mae", 3) == 600, "the spike at 300 loses to the plateau around 600"
+    auc = [{"step": s, "roc_auc": a} for s, a in ((100, 0.60), (200, 0.70), (300, 0.65), (400, 0.80), (500, 0.66))]
+    assert sweep.windowed(auc, "roc_auc", 1) == 400 and sweep.windowed(auc, "roc_auc", 3) == 300, (
+        "the smoothed peak is the window centred one validation before the spike"
+    )
+    assert sweep.windowed(auc[:2], "roc_auc", 5) == 200, "a curve shorter than the window yields its middle"
+    with pytest.raises(ValueError):
+        sweep.windowed(history, "mae", 2)
+    assert sweep.windows(SimpleNamespace(refit_windows="1,3,5")) == (1, 3, 5)
+    assert sweep.windows(SimpleNamespace()) == (1,)
+
+
 def test_plan_narrows_the_space_and_starts_from_a_chosen_configuration():
     space = {"ema_decay": [None], "learning_rate": [6e-4, 3e-3], "dropout": [0.1, 0.2], "batch_size": [128, 256]}
     default = {"d_model": 64, "ffnx": 4, "learning_rate": 1.46e-3, "weight_decay": 0.0}
@@ -118,7 +156,7 @@ def test_plan_narrows_the_space_and_starts_from_a_chosen_configuration():
         sweep.plan("rel-f1/driver-position", 7_453, 2, seed=1, space={"learning_rate": [1e-3]})
     with pytest.raises(ValueError, match="non-empty list"):
         sweep.plan("rel-f1/driver-position", 7_453, 2, seed=1, space={"dropout": []})
-    with pytest.raises(KeyError, match="unknown default parameter"):
+    with pytest.raises(KeyError, match="unknown configuration parameter"):
         sweep.plan("rel-f1/driver-position", 7_453, 2, seed=1, default={"heads": 4})
     with pytest.raises(ValueError, match="divisible"):
         sweep.plan("rel-f1/driver-position", 7_453, 2, seed=1, default={"d_model": 30, "n_heads": 4})
@@ -699,7 +737,7 @@ def test_execute_runs_the_child_inside_its_own_directory(tmp_path, monkeypatch):
 def test_spaces_cap_the_batch_size_finder_instead_of_sampling_sizes():
     caps = [sweep.SPACES[level]["batch_size"] for level in ("small", "medium", "large")]
     assert all(len(cap) == 1 for cap in caps), "the cap is a compute knob fixed per tier, not a searched size"
-    assert [cap[0] for cap in caps] == [256, 512, 1024]
+    assert [cap[0] for cap in caps] == [64, 512, 1024]
     assert all(
         sweep.TIER_DEFAULTS[level]["batch_size"] == sweep.SPACES[level]["batch_size"][0]
         for level in caps and sweep.SPACES
