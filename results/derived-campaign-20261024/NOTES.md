@@ -19,6 +19,7 @@ below is a TODO to consolidate once the other tasks have results; nothing here i
 | `sweep.py` (10-25) | `TIER_OVERRIDES` carries the medium (d96 L2 h4 dropout 0.2 lr 4e-4) and large (d128 L2 h8 dropout 0.1 lr 3e-4) trial-0 defaults the Modal campaign launched with | the lab item-churn loop started from the bare `DEFAULT` (d64 L2 h4 dropout 0.1 lr 1e-3), so its trial 0 was not comparable with the Modal large launches |
 | `c81ae4a` | prepared-data reuse strips mask/jitter/objective on every field (the comparison was handed the fields mapping, so nothing below it was stripped) | every regularized Optuna proposal in the frozen small sweeps and the lab loop failed the reuse check in seconds; the four `frozen-1024c` sweeps were cleaned (failed rows and folders dropped, default seeds kept) and resumed on the separately deployed app `relflow-relarena-sweep-b` |
 | `846a516`, `63f3194` | classification plans pin `objective`; a knob a space fixes to one choice is set by the optimizer, never sampled | TPE spent draws on an inert loss knob on classification tasks; the lab item-churn loop was rebuilt as `optuna-amazon-item-churn-large` with d_model {128, 192, 256}, ffnx 4, no objective knob |
+| `dca8ab6` (10-25) | small tier rebuilt as an explicit grid: {default, lr 7.6e-4 + wd 0.01} x stopping {(2,1), (6,2), (12,4)} (patience, plateau patience) x 3 seeds, batch 64, every trial refit at selection windows 1/3/5 (the carried step comes from the best window of consecutive validations); fifth small task rel-event/user-ignore; runs `grid-1025-s2/s6/s12` on app `relflow-relarena-sweep-b`, one container per task and stopping level | the Optuna small loops showed configuration explaining 10-68% of test variance against seeds, validation order not transferring, and the frozen default on the flat top of its space; what is left to learn is the selection and stopping rule, not the knobs |
 | sweep spaces | narrowed tier spaces and new trial-0 defaults from the 10-23 small sweeps and the lab site-success sweep (`scratchpad/modal/campaign/spaces.json`) | ema 0.999 and dropout 0 never won; the small default (d64 L2 h2 dropout 0.3 lr 2.3e-3 ema 0.99) topped three of four tasks |
 
 ## Findings worth keeping
@@ -41,6 +42,13 @@ below is a TODO to consolidate once the other tasks have results; nothing here i
   seeds, dropout alone and absolute time do not.
 - Validation selection over 25 trials on a 499-row validation split is a winner's-curse
   draw: the winner's early checkpoint (step 120 of 480) does not survive the test shift.
+- Small-tier seed study (frozen loops, 3 seeds per configuration): test scatters about twice as
+  much across seeds as validation; configuration explains 68% of test variance on ad-ctr, 33% on
+  driver-position, 10% on study-outcome; val->test Spearman +0.29 / +0.16 / -0.04 / +0.26; the
+  val->test change is a per-task constant (ad-ctr -10.8%, F1 -4.8%, user-attendance -4.0%,
+  study-outcome +6.9%) with 1-4 point spread; EMA 0.99 converts about 3 points better than no
+  EMA; the heavy corner (dropout 0.4, wd 0.3, EMA 0.995, huber, mask 0.1) was worse everywhere
+  and is confounded (same startup proposal on every task).
 - Site-success schema ablation (same default d96 L2 dropout 0.2 lr 4e-4, A10G, 3 h cap,
   validation MAE): hand 0.3643 (8 passes, 2.1 h), derived 0.3737 (7.1 passes, time cap),
   derived without depth-two nesting 0.3747 (8 passes, 0.68 h); the nested-text variant ran
