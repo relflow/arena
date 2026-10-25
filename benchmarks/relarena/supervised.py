@@ -154,13 +154,21 @@ def prepare(
 
 
 def unbounded(model: dict) -> dict:
-    """Copy the model with unbounded repeated branches and no overflow policies."""
+    """Copy the model without the training choices that leave its observations unchanged.
+
+    Branch caps and overflow policies, input jitter, training-only mask rates and the
+    target's loss objective shape training, not the materialized rows.
+    """
     result = dict(model)
     if "fields" in result:
         result["fields"] = {name: unbounded(value) for name, value in result["fields"].items()}
     if result.get("type") == "branch":
         result.pop("overflow", None)
         result["length"] = None
+    result.pop("jitter", None)
+    result.pop("objective", None)
+    if isinstance(result.get("mask"), float):
+        result.pop("mask")
     return result
 
 
@@ -202,12 +210,12 @@ def reuse(spec: BenchmarkSpec, directory: Path, *, report_path: Path, seed: int)
     old_model = yaml.safe_load(original_model.read_text())
     new_model = yaml.safe_load(spec.model_path.read_text())
     old_batch_size, new_batch_size = old_model.get("batch_size"), new_model.get("batch_size")
-    # Materialized observations depend on the query and the field contract alone;
-    # width, depth, heads, feed-forward, dropout, batch size, and branch caps are training choices.
+    # Materialized observations depend on the query and the field contract alone; width, depth, heads,
+    # feed-forward, dropout, batch size, branch caps, jitter, mask rates and the loss are training choices.
     if original.query != spec.query or unbounded(old_model.get("fields", {})) != unbounded(new_model.get("fields", {})):
         raise ValueError(
-            "Prepared-data reuse allows only architecture, batch-size, and branch length/overflow changes; "
-            "SQL and field definitions must match"
+            "Prepared-data reuse allows only architecture, batch-size, regularization, and branch "
+            "length/overflow changes; SQL and field definitions must match"
         )
     cache = Path(get_relbench_cache_dir()) / spec.dataset_name
     source_hashes = reports.hashes({name: cache / "db" / f"{name}.parquet" for name in spec.sources})

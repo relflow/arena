@@ -536,7 +536,10 @@ def exhausted(report: dict | None, log_path: Path) -> bool:
         with log_path.open("rb") as log:
             log.seek(max(0, log_path.stat().st_size - 65536))
             text = log.read().decode("utf-8", "replace")
-    return "OutOfMemoryError" in text or "out of memory" in text.lower()
+    # Only the accelerator's exhaustion earns a smaller batch; DuckDB's "Out of Memory Error" during
+    # preparation does not shrink with the batch and must surface as a failure.
+    lowered = text.lower()
+    return "cuda out of memory" in lowered or ("outofmemoryerror" in lowered and "duckdb" not in lowered)
 
 
 def execute(args, argv: list[str], directory: Path, log_path: Path) -> int:

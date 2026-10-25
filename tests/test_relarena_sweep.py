@@ -979,3 +979,14 @@ def test_trial_commands_carry_their_own_seed(tmp_path):
     args = options(training_rows=400, source=str(tmp_path), environment={}, gpu_lock=None)
     argv = sweep.command(args, sweep.TIER_DEFAULTS["small"], tmp_path / "b.yaml", tmp_path / "t", None, seed=7)
     assert argv[argv.index("--seed") + 1] == "7"
+
+
+def test_exhausted_only_believes_accelerator_memory(tmp_path):
+    cuda = {"error": {"type": "OutOfMemoryError", "message": "CUDA out of memory. Tried to allocate 2.00 MiB"}}
+    duck = {
+        "error": {
+            "type": "OutOfMemoryException",
+            "message": "duckdb.duckdb.OutOfMemoryException: Out of Memory Error: failed to allocate data of size 64.0 KiB",
+        }
+    }
+    assert sweep.exhausted(cuda, tmp_path / "none.log") and not sweep.exhausted(duck, tmp_path / "none.log")

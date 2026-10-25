@@ -117,7 +117,7 @@ def prepare(
             spec,
             directory / f"{name}.parquet",
             include_target=labelled,
-            fetch_size=16384,
+            fetch_size=8192,
             duckdb_config=duckdb_config,
         )
         timings[name] = time.monotonic() - started

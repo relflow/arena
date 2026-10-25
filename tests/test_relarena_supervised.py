@@ -879,3 +879,12 @@ def test_loader_workers_follow_text_fields():
     assert loader_workers("auto", plain) == 0
     assert 1 <= loader_workers("auto", textual) <= 4
     assert loader_workers(3, textual) == 3 and loader_workers("0", textual) == 0
+
+
+def test_prepared_data_reuse_ignores_field_regularizers():
+    base = {"fields": {"amount": {"type": "number"}, "events": {"type": "branch", "length": 8, "overflow": "tail", "fields": {"note": {"type": "text"}}}, "target": {"type": "number", "mask": True}}}  # fmt: skip
+    tuned = {"fields": {"amount": {"type": "number", "jitter": {"add": 0.05}, "mask": 0.1}, "events": {"type": "branch", "length": 32, "fields": {"note": {"type": "text", "mask": 0.1}}}, "target": {"type": "number", "mask": True, "objective": "huber"}}}  # fmt: skip
+    assert supervised.unbounded(base) == supervised.unbounded(tuned)
+    assert supervised.unbounded(tuned)["fields"]["target"] == {"type": "number", "mask": True}, (
+        "the target's contract mask stays"
+    )
