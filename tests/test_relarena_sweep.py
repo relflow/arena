@@ -94,7 +94,9 @@ def test_plan_narrows_the_space_and_starts_from_a_chosen_configuration():
     data = sweep.plan("rel-f1/driver-position", 7_453, 12, seed=1, space=space, default=default)
     assert data["trials"][0]["config"] == {**sweep.TIER_DEFAULTS["small"], **default}
     assert data["space"]["ema_decay"] == (None,) and data["space"]["n_layers"] == sweep.SPACES["small"]["n_layers"]
-    for trial in data["trials"][1:]:
+    for trial in data["trials"]:
+        if trial["config_id"] == data["trials"][0]["config_id"]:
+            continue  # the default's own seeds
         config = trial["config"]
         assert config["ema_decay"] is None and config["dropout"] in (0.1, 0.2) and config["batch_size"] in (128, 256)
         assert 6e-4 <= config["learning_rate"] <= 3e-3
@@ -177,7 +179,7 @@ def test_command_carries_the_schedule_full_splits_and_prepared_data(tmp_path):
 
 
 def test_run_records_results_resumes_and_honours_stop(tmp_path, monkeypatch):
-    data = sweep.plan("rel-f1/driver-position", 7453, 2, seed=1)
+    data = sweep.plan("rel-f1/driver-position", 7453, 2, seed=1, seeds=1)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(data))
     calls = []
@@ -586,7 +588,7 @@ def test_queue_runs_tasks_smallest_first_and_skips_finished_ones(tmp_path, monke
 
 
 def test_refit_subcommand_refits_without_admitting_pending_trials(tmp_path, monkeypatch):
-    data = sweep.plan("rel-f1/driver-position", 7453, 2, seed=1)
+    data = sweep.plan("rel-f1/driver-position", 7453, 2, seed=1, seeds=1)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(data))
     directory = tmp_path / "sweep"
@@ -764,7 +766,7 @@ def test_run_relaunches_an_out_of_memory_trial_at_half_the_batch_size(tmp_path, 
 
 
 def test_run_does_not_relaunch_other_failures_or_below_the_batch_floor(tmp_path, monkeypatch):
-    data = sweep.plan("rel-f1/driver-position", 7453, 2, seed=1)
+    data = sweep.plan("rel-f1/driver-position", 7453, 2, seed=1, seeds=1)
     data["trials"] = data["trials"][:2]
     data["trials"][0]["config"]["batch_size"] = 64
     data["trials"][1]["config"]["batch_size"] = sweep.BATCH_FLOOR
@@ -940,3 +942,33 @@ def test_optimize_proposes_trials_from_a_warm_started_study(tmp_path, monkeypatc
     origins = {t.user_attrs.get("origin") for t in study.trials}
     assert "earlier:0" in origins and "earlier:1" not in origins, "warm start admits only configs inside the space"
     assert len(study.trials) == 4 and (tmp_path / "sweep/README.md").exists()
+
+
+def test_small_plans_repeat_each_configuration_over_seeds_and_select_on_the_mean():
+    data = sweep.plan("rel-f1/driver-position", 7453, 2, 5)
+    assert data["seeds"] == 3 and len(data["trials"]) == 9
+    first = [t for t in data["trials"] if t["config_id"] == data["trials"][0]["config_id"]]
+    assert [t["seed"] for t in first] == [5, 6, 7] and all(t["config"] == first[0]["config"] for t in first)
+    assert sweep.within(first[0]["config"], sweep.SPACES["small"]) and first[0]["config"]["ema_decay"] == 0.99
+    assert "mask" in sweep.SPACES["small"] and "jitter" in sweep.SPACES["small"]
+
+    def done(index, config_id, seed, score, step):
+        return {"index": index, "config": sweep.TIER_DEFAULTS["small"], "config_id": config_id, "seed": seed, "status": "done", "summary": {"metric": "mae", "score": score, "selected_step": step}}  # fmt: skip
+
+    lucky = {**sweep.TIER_DEFAULTS["small"], "dropout": 0.4}
+    state = {"name": "unit", "task": "rel-f1/driver-position", "tier": "small", "seed": 0, "plan_sha256": "x",
+             "trials": [done(0, "a", 0, 3.6, 100), done(1, "a", 1, 3.7, 120), done(2, "a", 2, 3.65, 110), done(3, "b", 0, 3.5, 50), done(4, "b", 1, 3.9, 60), done(5, "b", 2, 3.85, 70)]}  # fmt: skip
+    for t in state["trials"][3:]:
+        t["config"] = lucky
+    best = sweep.winner(state)
+    assert best["config_id"] == "a" and best["index"] == 0 and best["seeds"] == 3
+    assert abs(best["summary"]["score"] - 3.65) < 1e-9 and best["summary"]["selected_step"] == 110, (
+        "a single lucky seed (3.5) does not beat a configuration whose three seeds average better"
+    )
+    assert "| 1 | a | 3 | 3.65000 |" in sweep.leaderboard(state)
+
+
+def test_trial_commands_carry_their_own_seed(tmp_path):
+    args = options(training_rows=400, source=str(tmp_path), environment={}, gpu_lock=None)
+    argv = sweep.command(args, sweep.TIER_DEFAULTS["small"], tmp_path / "b.yaml", tmp_path / "t", None, seed=7)
+    assert argv[argv.index("--seed") + 1] == "7"

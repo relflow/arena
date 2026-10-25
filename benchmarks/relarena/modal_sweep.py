@@ -80,6 +80,7 @@ def commands(
     refit_every_trial: bool = False,
     optimize: int = 0,
     warm_start: tuple[str, ...] = (),
+    seeds: int = 0,
 ) -> tuple[list[str], list[str]]:
     """The plan and run commands for one task's sweep, all paths on the Volume.
 
@@ -90,6 +91,7 @@ def commands(
     plan = [
         python, "-m", "benchmarks.relarena.sweep", "plan",
         "--task", task, "--cache", str(cache), "--trials", str(0 if optimize else trials), "--seed", str(seed),
+        *(["--seeds", str(seeds)] if seeds else []),
         "--output", str(output / "plan.json"),
     ]  # fmt: skip
     if space:
@@ -99,7 +101,7 @@ def commands(
     run = [
         python, "-m", "benchmarks.relarena.sweep", "optimize" if optimize else "run",
         "--plan", str(output / "plan.json"), "--name", name, "--output", str(output),
-        *(["--trials", str(optimize), *(["--warm-start", *warm_start] if warm_start else [])] if optimize else []),
+        *(["--trials", str(optimize), *(["--seeds", str(seeds)] if seeds else []), *(["--warm-start", *warm_start] if warm_start else [])] if optimize else []),
         "--python", python, "--source", source, "--cache", str(cache),
         "--seed", str(seed), "--trial-seconds", str(trial_seconds), "--max-hours", str(max_hours),
         "--patience", str(patience), "--plateau-patience", str(plateau_patience),
@@ -160,6 +162,7 @@ def sweep(
     refit_every_trial: bool = False,
     optimize: int = 0,
     warm_start: str = "",
+    seeds: int = 0,
 ) -> str:
     """Plan and run one task's sweep on this container's GPU; return the leaderboard."""
     output = ROOT / "runs" / (name or f"modal-{task.replace('/', '-')}" + (f"-{suffix}" if suffix else ""))
@@ -190,6 +193,7 @@ def sweep(
         refit_every_trial=refit_every_trial,
         optimize=optimize,
         warm_start=tuple(item for item in warm_start.split(",") if item),
+        seeds=seeds,
     )
     log = output / "sweep.log"
     stop = threading.Event()
@@ -226,6 +230,7 @@ def main(
     refit_every_trial: bool = False,
     optimize: int = 0,
     warm_start: str = "",
+    seeds: int = 0,
 ) -> None:
     """Sweep one task, or fan out across a comma-separated list of tasks, one container each.
 
@@ -250,6 +255,7 @@ def main(
             "refit_every_trial": refit_every_trial,
             "optimize": optimize,
             "warm_start": warm_start,
+            "seeds": seeds,
         },
     ):
         print(result, flush=True)
@@ -278,6 +284,7 @@ def launch(argv: list[str] | None = None) -> list[str]:
     parser.add_argument(
         "--warm-start", default="", help="comma-separated state.json paths on the Volume to seed the study"
     )
+    parser.add_argument("--seeds", type=int, default=0, help="seeds per configuration; 0 uses the tier's count")
     args = parser.parse_args(argv)
     function = modal.Function.from_name(app.name, "sweep")
     calls = []
@@ -298,6 +305,7 @@ def launch(argv: list[str] | None = None) -> list[str]:
             refit_every_trial=args.refit_every_trial,
             optimize=args.optimize,
             warm_start=args.warm_start,
+            seeds=args.seeds,
         )
         print(f"{task} {call.object_id}", flush=True)
         calls.append(call.object_id)

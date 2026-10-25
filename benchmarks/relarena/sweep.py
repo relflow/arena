@@ -67,18 +67,21 @@ REGULARIZERS = {"jitter": (0.0, 0.05, 0.1), "mask": (0.0, 0.1, 0.2), "objective"
 # user-attendance, so both ends stay in the space and EMA stays available.
 SPACES = {
     "small": {
-        # Rebuilt 2026-10-24 around regularization: on driver-position and ad-ctr the validation winners
-        # were the least regularized samples and converted worst on test, while EMA configs converted best.
+        # Frozen 2026-10-24 from the conversion dataset: within a sweep the validation order did not
+        # transfer to test, while regularization did (EMA, dropout 0.3+, weight decay 0.1+), so the tier
+        # searches only regularization and the input perturbations, with seeds averaged per configuration.
         "d_model": (64, 96),
         "n_layers": (1, 2),
         "n_heads": (4,),
         "ffnx": (4, 8),
-        "dropout": (0.2, 0.3, 0.4, 0.5),
+        "dropout": (0.3, 0.4),
         "batch_size": (256,),
-        "learning_rate": (5e-4, 3e-3),
-        "weight_decay": (0.01, 0.1, 0.3),
-        "ema_decay": (None, 0.98, 0.99, 0.995, 0.999),
-        **REGULARIZERS,
+        "learning_rate": (1e-3, 3e-3),
+        "weight_decay": (0.1, 0.3),
+        "ema_decay": (0.99, 0.995),
+        "jitter": (0.0, 0.05, 0.1),
+        "mask": (0.0, 0.1, 0.2),
+        "objective": ("mae", "huber"),
     },
     "medium": {
         "d_model": (64, 96, 128),
@@ -108,6 +111,8 @@ SPACES = {
 # The untuned regime takes its tier's batch cap and the shared architecture defaults; a tier may
 # override the rest, within the coarse size tiers the harness allows.
 TIER_OVERRIDES = {"small": {"dropout": 0.3, "learning_rate": 2e-3, "weight_decay": 0.1, "ema_decay": 0.99}}
+# Trials that share a configuration and differ only by seed are selected on their mean validation score.
+SEEDS = {"small": 3, "medium": 1, "large": 1}
 TIER_DEFAULTS = {
     level: {**DEFAULT, **TIER_OVERRIDES.get(level, {}), "batch_size": space["batch_size"][0]}
     for level, space in SPACES.items()
@@ -162,8 +167,12 @@ def plan(
     *,
     space: dict | None = None,
     default: dict | None = None,
+    seeds: int | None = None,
 ) -> dict:
     """The default configuration first, then ``trials`` distinct samples from the task's tier.
+
+    Each configuration becomes ``seeds`` trials (the tier's count by default) that differ only
+    by seed; selection averages them.
 
     ``space`` narrows the tier's choices per parameter and ``default`` overrides
     the first trial, so a second sweep can follow the evidence of an earlier one.
@@ -198,8 +207,19 @@ def plan(
         "budget": {"passes": entry["passes"], "backstop_seconds": entry["backstop_seconds"]},
         "seed": seed,
         "space": chosen,
-        "trials": [{"index": index, "config": config} for index, config in enumerate(configs)],
+        "seeds": seeds or SEEDS[level],
+        "trials": [
+            {"index": index, "config": config, "config_id": identity(config), "seed": seed + repeat}
+            for index, (config, repeat) in enumerate((c, r) for c in configs for r in range(seeds or SEEDS[level]))
+        ],
     }
+
+
+def identity(config: dict) -> str:
+    """A stable name for one configuration, shared by its seeds."""
+    import hashlib
+
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
 
 
 JITTERED = {"number", "vector", "dateparts", "text"}
@@ -263,7 +283,9 @@ def budget(args) -> dict:
     return {"passes": passes, "backstop_seconds": seconds}
 
 
-def command(args, config: dict, bundle_spec: Path, directory: Path, prepared: Path | None) -> list[str]:
+def command(
+    args, config: dict, bundle_spec: Path, directory: Path, prepared: Path | None, *, seed: int | None = None
+) -> list[str]:
     """The supervised runner's command for one trial: full splits, plateau schedule, early stops, no test access."""
     result = [
         args.python,
@@ -284,7 +306,7 @@ def command(args, config: dict, bundle_spec: Path, directory: Path, prepared: Pa
         "--precision",
         "bf16-mixed",
         "--seed",
-        str(args.seed),
+        str(args.seed if seed is None else seed),
         "--batch-size",
         "auto",
         "--max-batch-size",
@@ -374,14 +396,32 @@ def leaderboard(state: dict) -> str:
         f"{len(done)} scored of {len(trials)} trials; metric {mode or '?'} "
         f"({'higher' if maximize else 'lower'} is better). Validation-only selection; the test split is never read.",
         "",
-        "| rank | trial | score | test | d_model | layers | heads | ffnx | dropout | batch | lr | wd | ema | jitter | mask | loss | steps | passes | drops | stop | minutes |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---:|",
+        "| rank | trial | seed | score | test | d_model | layers | heads | ffnx | dropout | batch | lr | wd | ema | jitter | mask | loss | steps | passes | drops | stop | minutes |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---:|",
     ]
+    ranked = groups(state)
+    if any(len(g["members"]) > 1 for g in ranked):
+        lines = (
+            lines[:4]
+            + [
+                "| rank | configuration | seeds | mean score | spread | mean test | d_model | layers | dropout | lr | wd | ema | jitter | mask | loss |",
+                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+                *(
+                    f"| {rank} | {g['config_id']} | {len(g['members'])} | {g['score']:.5f} | {g['spread']:.5f} | "
+                    f"{'' if g['test'] is None else f'{g["test"]:.5f}'} | {g['config']['d_model']} | {g['config']['n_layers']} | "
+                    f"{g['config']['dropout']} | {g['config']['learning_rate']:.2e} | {g['config']['weight_decay']} | {g['config']['ema_decay'] or '-'} | "
+                    f"{g['config'].get('jitter', 0.0)} | {g['config'].get('mask', 0.0)} | {g['config'].get('objective', 'mae')} |"
+                    for rank, g in enumerate(ranked, start=1)
+                ),
+                "",
+            ]
+            + lines[4:]
+        )
     for rank, trial in enumerate(done, start=1):
         c, s = trial["config"], trial["summary"]
         test = ((trial.get("refit") or {}).get("test") or {}).get(s["metric"])
         lines.append(
-            f"| {rank} | {trial['index']} | {s['score']:.5f} | {'' if test is None else f'{test:.5f}'} | "
+            f"| {rank} | {trial['index']} | {trial.get('seed', state['seed'])} | {s['score']:.5f} | {'' if test is None else f'{test:.5f}'} | "
             f"{c['d_model']} | {c['n_layers']} | {c['n_heads']} | {c['ffnx']} | "
             f"{c['dropout']} | {s.get('batch_size') or c['batch_size']} | {c['learning_rate']:.2e} | {c['weight_decay']} | {c['ema_decay'] or '-'} | "
             f"{c.get('jitter', 0.0)} | {c.get('mask', 0.0)} | {c.get('objective', 'mae')} | "
@@ -414,7 +454,15 @@ def load_state(directory: Path, plan_data: dict, name: str) -> dict:
         "tier": plan_data["tier"],
         "seed": plan_data["seed"],
         "plan_sha256": plan_data["sha256"],
-        "trials": [{"index": t["index"], "config": t["config"], "status": "pending"} for t in plan_data["trials"]],
+        "trials": [
+            {
+                "index": t["index"],
+                "config": t["config"],
+                "status": "pending",
+                **{k: t[k] for k in ("config_id", "seed") if k in t},
+            }
+            for t in plan_data["trials"]
+        ],
     }
 
 
@@ -513,15 +561,48 @@ def execute(args, argv: list[str], directory: Path, log_path: Path) -> int:
                 lock.close()
 
 
-def winner(state: dict) -> dict | None:
-    """The scored trial the leaderboard ranks first, if any."""
+def groups(state: dict) -> list[dict]:
+    """Scored trials grouped by configuration: mean score and selected step over seeds, ranked best first."""
     done = [t for t in state["trials"] if t["status"] == "done" and t.get("summary", {}).get("score") is not None]
     if not done:
-        return None
+        return []
     maximize = done[0]["summary"]["metric"] == "roc_auc"
-    return (
-        max(done, key=lambda t: t["summary"]["score"]) if maximize else min(done, key=lambda t: t["summary"]["score"])
-    )
+    by: dict[str, list[dict]] = {}
+    for trial in done:
+        by.setdefault(trial.get("config_id") or identity(trial["config"]), []).append(trial)
+    out = []
+    for key, members in by.items():
+        members.sort(key=lambda t: t.get("seed", 0))
+        scores = [t["summary"]["score"] for t in members]
+        tests = [((t.get("refit") or {}).get("test") or {}).get(t["summary"]["metric"]) for t in members]
+        tests = [v for v in tests if v is not None]
+        out.append(
+            {
+                "config_id": key,
+                "config": members[0]["config"],
+                "members": members,
+                "score": sum(scores) / len(scores),
+                "spread": max(scores) - min(scores),
+                "selected_step": round(sum(t["summary"]["selected_step"] or 0 for t in members) / len(members)),
+                "test": sum(tests) / len(tests) if tests else None,
+            }
+        )
+    out.sort(key=lambda g: g["score"], reverse=maximize)
+    return out
+
+
+def winner(state: dict) -> dict | None:
+    """The trial that represents the best configuration: its lowest seed, carrying the seeds' mean score and step."""
+    ranked = groups(state)
+    if not ranked:
+        return None
+    best = ranked[0]
+    representative = best["members"][0]
+    return {
+        **representative,
+        "summary": {**representative["summary"], "score": best["score"], "selected_step": best["selected_step"]},
+        "seeds": len(best["members"]),
+    }
 
 
 def refit(args, state: dict, directory: Path, trial: dict | None = None) -> dict | None:
@@ -674,7 +755,7 @@ def execute_trial(args, spec: BenchmarkSpec, manifest: Path, state: dict, direct
         if trial_dir.exists():
             shutil.rmtree(trial_dir)
         bundle_spec = bundle(spec, config, trial_dir / "bundle", manifest)
-        argv = command(args, config, bundle_spec, trial_dir, prepared)
+        argv = command(args, config, bundle_spec, trial_dir, prepared, seed=trial.get("seed"))
         trial.update(config=config, command=argv)
         save(directory, state)
         print(
@@ -905,13 +986,22 @@ def optimize(args) -> int:
         config["batch_size"] = space["batch_size"][0]
         if config["d_model"] % config["n_heads"]:
             config["n_heads"] = max(head for head in space["n_heads"] if config["d_model"] % head == 0)
-        trial = {"index": len(state["trials"]), "config": config, "status": "pending", "optuna": asked.number}
-        state["trials"].append(trial)
+        seeds = args.seeds or plan_data.get("seeds") or SEEDS[level]
+        members = [
+            {"index": len(state["trials"]) + repeat, "config": config, "config_id": identity(config), "seed": plan_data["seed"] + repeat, "status": "pending", "optuna": asked.number}
+            for repeat in range(seeds)
+        ]  # fmt: skip
+        state["trials"].extend(members)
         save(directory, state)
         proposed += 1
-        execute_trial(args, spec, manifest, state, directory, trial)
-        if trial["status"] == "done" and smoothed(trial["summary"]) is not None:
-            study.tell(asked, float(smoothed(trial["summary"])))
+        values = []
+        for trial in members:
+            execute_trial(args, spec, manifest, state, directory, trial)
+            if trial["status"] == "done" and smoothed(trial["summary"]) is not None:
+                values.append(float(smoothed(trial["summary"])))
+        trial = members[0]
+        if values:
+            study.tell(asked, sum(values) / len(values))
         else:
             study.tell(asked, state=optuna.trial.TrialState.FAIL)
         best = study.best_trial if any(t.state.is_finished() and t.values for t in study.trials) else None
@@ -921,7 +1011,8 @@ def optimize(args) -> int:
                     "sweep": args.name,
                     "event": "optuna",
                     "trial": trial["index"],
-                    "objective": smoothed(trial.get("summary") or {}),
+                    "objective": sum(values) / len(values) if values else None,
+                    "seeds": len(values),
                     "best": None if best is None else {"value": best.value, "params": best.params},
                     "study_trials": len(study.trials),
                 }
@@ -997,6 +1088,7 @@ def arguments(argv=None):
     planner.add_argument("--cache", type=Path, required=True, help="RelBench cache holding the task's train split")
     planner.add_argument("--trials", type=int, default=24)
     planner.add_argument("--seed", type=int, default=0)
+    planner.add_argument("--seeds", type=int, help="Seeds per configuration; default is the tier's count")
     planner.add_argument(
         "--space",
         type=json.loads,
@@ -1056,6 +1148,7 @@ def arguments(argv=None):
     optimizer.add_argument("--output", required=True)
     optimizer.add_argument("--trials", type=int, default=24, help="Optuna proposals to run beyond the plan's trials")
     optimizer.add_argument("--startup", type=int, default=8, help="Random proposals before the TPE sampler takes over")
+    optimizer.add_argument("--seeds", type=int, help="Seeds per proposal; default is the plan's count")
     optimizer.add_argument("--warm-start", nargs="*", help="state.json files of earlier sweeps of this task")
     optimizer.add_argument(
         "--direction",
@@ -1095,7 +1188,7 @@ def main(argv=None) -> int:
     args = arguments(argv)
     if args.command == "plan":
         count = rows(args.cache, args.task)
-        data = plan(args.task, count, args.trials, args.seed, space=args.space, default=args.default)
+        data = plan(args.task, count, args.trials, args.seed, space=args.space, default=args.default, seeds=args.seeds)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(data, indent=2) + "\n")
         print(
