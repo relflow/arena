@@ -184,8 +184,7 @@ def plan(
     ``space`` narrows the tier's choices per parameter and ``default`` overrides
     the first trial, so a second sweep can follow the evidence of an earlier one.
     ``metric`` is the task's selection metric; a classification task has no regression
-    loss to choose, so its ``objective`` is pinned and never sampled. A knob the space
-    pins to one choice also applies to the first trial unless ``default`` sets it.
+    loss to choose, so its ``objective`` is pinned and never sampled.
     """
     if task not in TASKS:
         raise KeyError(f"Unknown benchmark {task!r}")
@@ -196,7 +195,7 @@ def plan(
     chosen = narrow(level, space)
     if metric == "roc_auc" and "objective" not in (space or {}):
         chosen["objective"] = (DEFAULT["objective"],)
-    first = {**TIER_DEFAULTS[level], **pinned(chosen), **(default or {})}
+    first = {**TIER_DEFAULTS[level], **(default or {})}
     if unknown := sorted(set(first) - set(DEFAULT)):
         raise KeyError(f"unknown default parameter(s) {unknown}; expected one of {sorted(DEFAULT)}")
     if first["d_model"] % first["n_heads"]:

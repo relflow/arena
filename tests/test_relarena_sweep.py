@@ -92,7 +92,8 @@ def test_classification_plans_pin_the_loss_objective_and_pinned_knobs_are_never_
     data = sweep.plan("rel-amazon/user-churn", 100_000, 6, seed=3, space={"ffnx": [4]}, metric="roc_auc")
     assert data["metric"] == "roc_auc" and data["space"]["objective"] == ("mae",) and data["space"]["ffnx"] == (4,)
     assert {t["config"]["objective"] for t in data["trials"]} == {"mae"}
-    assert {t["config"]["ffnx"] for t in data["trials"]} == {4}
+    sampled = [t for t in data["trials"] if t["config_id"] != data["trials"][0]["config_id"]]
+    assert sampled and {t["config"]["ffnx"] for t in sampled} == {4}, "the space pins sampled trials; the default stays"
     assert sweep.pinned(data["space"]) == {"objective": "mae", "ffnx": 4, "batch_size": data["space"]["batch_size"][0]}
     assert not {"objective", "ffnx", "batch_size"} & set(sweep.distributions(data["space"]))
     regression = sweep.plan("rel-avito/ad-ctr", 5_100, 2, seed=3, metric="mae")
