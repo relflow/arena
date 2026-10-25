@@ -496,8 +496,12 @@ def nested_for(
     entity: str,
     absorbed: set[str],
     budgets: Mapping[str, int],
+    nested_text: bool = False,
 ) -> tuple[str | None, tuple[Branch, ...]]:
-    """Children of the branch's rows or of one dimension it points at, keyed by the branch column that reaches them."""
+    """Children of the branch's rows or of one dimension it points at, keyed by the branch column that reaches them.
+
+    ``nested_text`` lets prose ride along at depth two, which the default rule leaves out.
+    """
     options: dict[str, list[tuple[Table, str]]] = {}
     link = own_columns(branch) <= LINK_COLUMNS
     for name, candidate in tables.items():
@@ -526,10 +530,18 @@ def nested_for(
                 dataset,
                 names,
                 exclude={column, *((candidate.time,) if candidate.time else ())},
-                text=False,
+                text=nested_text,
             )
             hop1, _ = lookups_for(
-                con, candidate, tables, dataset, names, exclude={column}, hops=1, text=False, row_time=candidate.time
+                con,
+                candidate,
+                tables,
+                dataset,
+                names,
+                exclude={column},
+                hops=1,
+                text=nested_text,
+                row_time=candidate.time,
             )
             columns, lookups = trim(columns, [hop1], budgets["fields"])
             branches.append(
@@ -554,8 +566,19 @@ def nested_for(
     return best[0], tuple(best[1])
 
 
-def derive(con: duckdb.DuckDBPyConnection, tables: Mapping[str, Table], meta: Meta) -> Task:
-    """Build the raw-structure task for one entity table from measured tables."""
+def derive(
+    con: duckdb.DuckDBPyConnection,
+    tables: Mapping[str, Table],
+    meta: Meta,
+    *,
+    nested: bool = True,
+    nested_text: bool = False,
+) -> Task:
+    """Build the raw-structure task for one entity table from measured tables.
+
+    ``nested=False`` stops at depth one; ``nested_text`` admits prose below it. Both are
+    ablation switches for comparing derived structures, not harness options.
+    """
     entity = tables[meta.entity_table]
     if entity.pkey is None:
         raise ValueError(f"entity table {meta.entity_table!r} has no primary key")
@@ -615,8 +638,19 @@ def derive(con: duckdb.DuckDBPyConnection, tables: Mapping[str, Table], meta: Me
             )
             absorbed.add(sibling.name)
         columns, lookups = trim(columns, [hop1, siblings, hop2], budgets["fields"])
-        child_key, nested = nested_for(
-            con, table, tables, meta.dataset, entity=entity.name, absorbed=absorbed, budgets=budgets
+        child_key, children = (
+            nested_for(
+                con,
+                table,
+                tables,
+                meta.dataset,
+                entity=entity.name,
+                absorbed=absorbed,
+                budgets=budgets,
+                nested_text=nested_text,
+            )
+            if nested
+            else (None, ())
         )
         multiple = sum(1 for t, _ in candidates if t is table) > 1
         branches.append(
@@ -628,7 +662,7 @@ def derive(con: duckdb.DuckDBPyConnection, tables: Mapping[str, Table], meta: Me
                 budgets["branch"],
                 columns,
                 lookups=tuple(lookups),
-                nested=nested,
+                nested=children,
                 child_key=child_key,
                 key=(column,),
                 intraday=intraday(table),
@@ -764,7 +798,15 @@ def relbench_meta(cache: pathlib.Path, dataset: str, task: str) -> tuple[Meta, s
     return meta, str(source.val_timestamp)
 
 
-def derive_relbench(cache: pathlib.Path, name: str, output: pathlib.Path, *, threads: int = 8) -> pathlib.Path:
+def derive_relbench(
+    cache: pathlib.Path,
+    name: str,
+    output: pathlib.Path,
+    *,
+    threads: int = 8,
+    nested: bool = True,
+    nested_text: bool = False,
+) -> pathlib.Path:
     """Derive one RelBench task from the cache as the harness would present it, writing its bundle under ``output``."""
     dataset, task = name.split("/")
     meta, cutoff = relbench_meta(cache, dataset, task)
@@ -772,7 +814,7 @@ def derive_relbench(cache: pathlib.Path, name: str, output: pathlib.Path, *, thr
     con = duckdb.connect()
     con.execute(f"SET threads TO {threads}")
     tables = profile(con, relbench_sources(cache, dataset, schema, cutoff), schema)
-    directory = write(derive(con, tables, meta), meta, output)
+    directory = write(derive(con, tables, meta, nested=nested, nested_text=nested_text), meta, output)
     record = {
         "dataset": dataset,
         "task": task,
@@ -793,8 +835,17 @@ def main(argv=None) -> int:
     parser.add_argument("--cache", type=pathlib.Path, required=True, help="RelBench cache root")
     parser.add_argument("--output", type=pathlib.Path, required=True, help="Root receiving <dataset>/<task>/")
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--no-nested", action="store_true", help="ablation: stop at depth one")
+    parser.add_argument("--nested-text", action="store_true", help="ablation: admit prose fields below depth one")
     args = parser.parse_args(argv)
-    directory = derive_relbench(args.cache, args.relbench, args.output, threads=args.threads)
+    directory = derive_relbench(
+        args.cache,
+        args.relbench,
+        args.output,
+        threads=args.threads,
+        nested=not args.no_nested,
+        nested_text=args.nested_text,
+    )
     print(json.dumps({"task": args.relbench, "bundle": str(directory)}))
     return 0
 
