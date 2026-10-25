@@ -479,6 +479,39 @@ def test_reuse_verifies_and_links_full_splits_without_materialization(task, tmp_
     assert set(result["task_parquet_sha256"]) == {"train", "val"}
 
 
+def test_reuse_accepts_regularizers_and_branch_caps_on_every_field(task, tmp_path, monkeypatch):
+    """The sweep writes mask rates, jitter, loss objectives and branch caps per field; none change the rows."""
+    spec, path, _ = prepared_report(task, tmp_path / "original")
+    new_directory = tmp_path / "tuned"
+    new_directory.mkdir()
+    model, query = new_directory / "model.yaml", new_directory / "observations.sql"
+    config = yaml.safe_load(spec.model_path.read_text())
+
+    def tune(fields: dict) -> None:
+        for field in fields.values():
+            if field.get("type") == "branch":
+                field["length"] = 3
+                field["overflow"] = "head"
+                tune(field["fields"])
+            elif field.get("mask") is True:
+                if field["type"] == "number":
+                    field["objective"] = "huber"
+            else:
+                field["mask"] = 0.1
+                if field["type"] in ("number", "dateparts", "vector", "text"):
+                    field["jitter"] = {"add": 0.05}
+
+    tune(config["fields"])
+    assert config != yaml.safe_load(spec.model_path.read_text())
+    model.write_text(yaml.safe_dump(config))
+    query.write_text(spec.query)
+    monkeypatch.setattr(supervised, "materialize", Mock(side_effect=AssertionError("must reuse")))
+    result = supervised.reuse(
+        replace(spec, model_path=model, query_path=query), tmp_path / "reused", report_path=path, seed=1
+    )
+    assert result["preparation"] == "verified_immutable_reuse"
+
+
 @pytest.mark.parametrize("change", ["incomplete", "sampled", "test", "query", "model", "data", "source", "order"])
 def test_reuse_rejects_changed_data_or_contract(task, tmp_path, change):
     spec, path, report = prepared_report(task, tmp_path / "original")
