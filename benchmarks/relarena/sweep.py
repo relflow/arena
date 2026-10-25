@@ -174,6 +174,7 @@ def plan(
     space: dict | None = None,
     default: dict | None = None,
     seeds: int | None = None,
+    metric: str | None = None,
 ) -> dict:
     """The default configuration first, then ``trials`` distinct samples from the task's tier.
 
@@ -182,6 +183,9 @@ def plan(
 
     ``space`` narrows the tier's choices per parameter and ``default`` overrides
     the first trial, so a second sweep can follow the evidence of an earlier one.
+    ``metric`` is the task's selection metric; a classification task has no regression
+    loss to choose, so its ``objective`` is pinned and never sampled. A knob the space
+    pins to one choice also applies to the first trial unless ``default`` sets it.
     """
     if task not in TASKS:
         raise KeyError(f"Unknown benchmark {task!r}")
@@ -190,7 +194,9 @@ def plan(
     entry = tier(training_rows)
     level = entry["name"]
     chosen = narrow(level, space)
-    first = {**TIER_DEFAULTS[level], **(default or {})}
+    if metric == "roc_auc" and "objective" not in (space or {}):
+        chosen["objective"] = (DEFAULT["objective"],)
+    first = {**TIER_DEFAULTS[level], **pinned(chosen), **(default or {})}
     if unknown := sorted(set(first) - set(DEFAULT)):
         raise KeyError(f"unknown default parameter(s) {unknown}; expected one of {sorted(DEFAULT)}")
     if first["d_model"] % first["n_heads"]:
@@ -214,6 +220,7 @@ def plan(
         "seed": seed,
         "space": chosen,
         "seeds": seeds or SEEDS[level],
+        **({"metric": metric} if metric else {}),
         "trials": [
             {"index": index, "config": config, "config_id": identity(config), "seed": seed + repeat}
             for index, (config, repeat) in enumerate((c, r) for c in configs for r in range(seeds or SEEDS[level]))
@@ -888,12 +895,19 @@ def smoothed(summary: dict, k: int = 3) -> float | None:
     return sum(top) / len(top)
 
 
+def pinned(space: dict) -> dict:
+    """Parameters a space fixes to one choice; the optimizer sets them instead of sampling them."""
+    return {name: choices[0] for name, choices in space.items() if name != "learning_rate" and len(choices) == 1}
+
+
 def distributions(space: dict):
-    """Optuna distributions for a tier space: categorical choices, a log-uniform learning rate."""
+    """Optuna distributions for a tier space: categorical choices, a log-uniform learning rate, no pinned knobs."""
     import optuna
 
     out = {}
     for name, choices in space.items():
+        if name in pinned(space):
+            continue
         if name == "learning_rate":
             out[name] = optuna.distributions.FloatDistribution(float(choices[0]), float(choices[1]), log=True)
         else:
@@ -962,7 +976,7 @@ def optimize(args) -> int:
         value = smoothed(summary)
         if value is None:
             return
-        params = {name: config.get(name, DEFAULT[name]) for name in space}
+        params = {name: config.get(name, DEFAULT[name]) for name in dists}
         study.add_trial(
             optuna.trial.create_trial(
                 params=params, distributions=dists, value=float(value), user_attrs={"origin": origin}
@@ -994,8 +1008,7 @@ def optimize(args) -> int:
             print(json.dumps({"sweep": args.name, "event": "stopped", "reason": "max hours"}), flush=True)
             break
         asked = study.ask(dists)
-        config = {**DEFAULT, **(first or {}), **asked.params}
-        config["batch_size"] = space["batch_size"][0]
+        config = {**DEFAULT, **(first or {}), **asked.params, **pinned(space)}
         if config["d_model"] % config["n_heads"]:
             config["n_heads"] = max(head for head in space["n_heads"] if config["d_model"] % head == 0)
         seeds = getattr(args, "seeds", None) or plan_data.get("seeds") or SEEDS[level]
@@ -1062,6 +1075,15 @@ def rows(cache: Path, task: str) -> int:
     """Training anchors of a task, from the RelBench cache."""
     dataset, name = task.split("/")
     return pq.ParquetFile(cache / dataset / "tasks" / name / "train.parquet").metadata.num_rows
+
+
+def metric_of(task: str) -> str:
+    """The task's selection metric from its RelBench definition: AUC for binary classification, else MAE."""
+    from relbench.tasks import get_task
+
+    dataset, name = task.split("/")
+    kind = get_task(dataset, name, download=False).task_type
+    return "roc_auc" if str(getattr(kind, "value", kind)) == "binary_classification" else "mae"
 
 
 def queue(args) -> int:
@@ -1200,7 +1222,16 @@ def main(argv=None) -> int:
     args = arguments(argv)
     if args.command == "plan":
         count = rows(args.cache, args.task)
-        data = plan(args.task, count, args.trials, args.seed, space=args.space, default=args.default, seeds=args.seeds)
+        data = plan(
+            args.task,
+            count,
+            args.trials,
+            args.seed,
+            space=args.space,
+            default=args.default,
+            seeds=args.seeds,
+            metric=metric_of(args.task),
+        )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(data, indent=2) + "\n")
         print(

@@ -88,6 +88,17 @@ def test_plan_puts_the_default_first_and_samples_distinct_configs_reproducibly()
     assert sweep.plan("rel-trial/site-success", 151_407, 12, seed=8) != first
 
 
+def test_classification_plans_pin_the_loss_objective_and_pinned_knobs_are_never_sampled():
+    data = sweep.plan("rel-amazon/user-churn", 100_000, 6, seed=3, space={"ffnx": [4]}, metric="roc_auc")
+    assert data["metric"] == "roc_auc" and data["space"]["objective"] == ("mae",) and data["space"]["ffnx"] == (4,)
+    assert {t["config"]["objective"] for t in data["trials"]} == {"mae"}
+    assert {t["config"]["ffnx"] for t in data["trials"]} == {4}
+    assert sweep.pinned(data["space"]) == {"objective": "mae", "ffnx": 4, "batch_size": data["space"]["batch_size"][0]}
+    assert not {"objective", "ffnx", "batch_size"} & set(sweep.distributions(data["space"]))
+    regression = sweep.plan("rel-avito/ad-ctr", 5_100, 2, seed=3, metric="mae")
+    assert regression["space"]["objective"] == sweep.SPACES["small"]["objective"]
+
+
 def test_plan_narrows_the_space_and_starts_from_a_chosen_configuration():
     space = {"ema_decay": [None], "learning_rate": [6e-4, 3e-3], "dropout": [0.1, 0.2], "batch_size": [128, 256]}
     default = {"d_model": 64, "ffnx": 4, "learning_rate": 1.46e-3, "weight_decay": 0.0}
